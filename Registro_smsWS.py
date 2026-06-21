@@ -140,7 +140,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     if (media.tag === 'img') {{
                         html += `<img src="${{media.local_path}}" alt="Imagen recibida">`;
                     }} else if (media.tag === 'video') {{
-                        html += `<video src="${{media.local_path}}" controls></video>`;
+                        html += `<video controls class="video-msg"><source src="${{media.local_path}}" type="video/mp4">Tu navegador no soporta el video.</video>`;
+                    }} else if (media.tag === 'audio') {{
+                        html += `<audio controls class="audio-msg" style="width: 250px;"><source src="${{media.local_path}}" type="audio/ogg">Tu navegador no soporta el audio.</audio>`;
                     }}
                 }});
                 html += '</div>';
@@ -229,6 +231,7 @@ def descargar_media(page, url, chat_dir, idx):
         ext = ".bin"
         mime = media_result.get('type', '')
         if 'video' in mime: ext = '.mp4'
+        elif 'audio' in mime or 'ogg' in mime: ext = '.ogg'
         elif 'webp' in mime: ext = '.webp'
         elif 'png' in mime: ext = '.png'
         elif 'image' in mime: ext = '.jpg'
@@ -321,11 +324,11 @@ def iniciar_guardado_mensajes():
                                         const textoMensaje = textContainer ? textContainer.innerText : '';
                                         
                                         // 3. Extraer multimedia (ignorando emojis)
-                                        const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video');
+                                        const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video, audio');
                                         const mediaUrls = [];
                                         
-                                        // DEBUG: Extraer todos los img y video sin filtros
-                                        const allMediaDebug = Array.from(row.querySelectorAll('img, video')).map(n => n.outerHTML);
+                                        // DEBUG: Extraer todos los img, video y audio sin filtros
+                                        const allMediaDebug = Array.from(row.querySelectorAll('img, video, audio')).map(n => n.outerHTML);
                                         
                                         mediaNodes.forEach(n => {
                                             let url = n.src;
@@ -333,8 +336,12 @@ def iniciar_guardado_mensajes():
                                                 const source = n.querySelector('source');
                                                 if (source) url = source.src;
                                             }
+                                            if (n.tagName.toLowerCase() === 'audio' && !url) {
+                                                const source = n.querySelector('source');
+                                                if (source) url = source.src;
+                                            }
                                             
-                                            if (url && (url.startsWith('blob:') || url.startsWith('data:image/') || url.startsWith('data:video/'))) {
+                                            if (url && (url.startsWith('blob:') || url.startsWith('data:image/') || url.startsWith('data:video/') || url.startsWith('data:audio/'))) {
                                                 mediaUrls.push({ tag: n.tagName.toLowerCase(), src: url });
                                             }
                                         });
@@ -377,17 +384,69 @@ def iniciar_guardado_mensajes():
                                             page.keyboard.press("Escape")
                                             time.sleep(0.5)
                                             
+                                    # --- PARCHE PARA NOTAS DE VOZ (Menú de descarga nativo) ---
+                                    # Al no existir un archivo visible, simularemos un clic en la flechita
+                                    # del mensaje para abrir el menú de WhatsApp y pulsar en "Descargar".
+                                    btn_audio = fila_actualizada.query_selector('button[aria-label="Reproducir mensaje de voz"]')
+                                    if btn_audio:
+                                        try:
+                                            print("  [DEBUG] Nota de voz detectada. Extrayendo archivo mediante el menú de opciones...")
+                                            # FORZAR HOVER PRIMERO: React no dibuja la flecha en el HTML hasta que el ratón pasa por encima
+                                            fila_actualizada.hover()
+                                            time.sleep(0.5)
+                                            
+                                            flecha_menu = fila_actualizada.query_selector('[data-testid="icon-down-context"]')
+                                            if not flecha_menu:
+                                                print("  [DEBUG] FATAL: No se encontró la flechita del menú incluso después de hover.")
+                                            else:
+                                                # Clic forzado por si está oculto
+                                                flecha_menu.click(force=True)
+                                                time.sleep(1) # Esperar a que el menú se dibuje en el DOM
+                                                
+                                                # Interceptar la ventana de descarga del navegador
+                                                with page.expect_download(timeout=5000) as download_info:
+                                                    # Clic en el botón Descargar mediante su aria-label nativo
+                                                    page.locator('button[aria-label="Descargar"], button[aria-label="Download"]').first.click()
+                                                
+                                                download = download_info.value
+                                                file_hash = hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
+                                                filename = f"media_{int(time.time())}_{len(media_urls)}_{file_hash}.ogg"
+                                                
+                                                media_folder = os.path.join(chat_dir, "media")
+                                                os.makedirs(media_folder, exist_ok=True)
+                                                filepath = os.path.join(media_folder, filename)
+                                                
+                                                # Guardar el archivo físicamente
+                                                download.save_as(filepath)
+                                                local_path = f"media/{filename}"
+                                                
+                                                # Lo añadimos a la lista de multimedia pero indicando que YA está descargado
+                                                media_urls.append({"tag": "audio", "local_path": local_path})
+                                                print("  [DEBUG] ¡Audio descargado exitosamente!")
+                                                
+                                        except Exception as e:
+                                            print(f"  [DEBUG] Error en el proceso de descarga: {e}")
+                                            page.keyboard.press("Escape")
+                                            
                                     all_media_debug = data_info.get("allMediaDebug", [])
                                     
                                     if media_urls:
                                         print(f"Descargando {len(media_urls)} archivo(s) multimedia...")
                                         for idx, m in enumerate(media_urls):
-                                            local_path = descargar_media(page, m["src"], chat_dir, idx)
-                                            if local_path:
+                                            if "local_path" in m:
+                                                # El archivo ya fue descargado por el interceptor del menú nativo
                                                 media_list.append({
                                                     "tag": m["tag"],
-                                                    "local_path": local_path
+                                                    "local_path": m["local_path"]
                                                 })
+                                            else:
+                                                # Método clásico de inyección JS para img y video
+                                                local_path = descargar_media(page, m["src"], chat_dir, idx)
+                                                if local_path:
+                                                    media_list.append({
+                                                        "tag": m["tag"],
+                                                        "local_path": local_path
+                                                    })
                                     elif all_media_debug:
                                         print(f"\\n[DEBUG INFO] Se encontró media pero los filtros la ignoraron. Etiquetas HTML encontradas:")
                                         for tag in all_media_debug:
