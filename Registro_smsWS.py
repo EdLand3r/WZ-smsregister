@@ -3,11 +3,28 @@ import time
 import tempfile
 import json
 import base64
+import hashlib
 from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = os.path.join(tempfile.gettempdir(), "playwright_whatsapp_firefox")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHATS_BASE_DIR = os.path.join(SCRIPT_DIR, "chats")
+
+chat_media_hashes = {}
+
+def get_chat_hashes(chat_dir):
+    if chat_dir not in chat_media_hashes:
+        hashes = {}
+        media_folder = os.path.join(chat_dir, "media")
+        if os.path.exists(media_folder):
+            for filename in os.listdir(media_folder):
+                filepath = os.path.join(media_folder, filename)
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        file_hash = hashlib.md5(f.read()).hexdigest()
+                        hashes[file_hash] = f"media/{filename}"
+        chat_media_hashes[chat_dir] = hashes
+    return chat_media_hashes[chat_dir]
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
@@ -201,6 +218,14 @@ def descargar_media(page, url, chat_dir, idx):
     """
     media_result = page.evaluate(js_code, url)
     if media_result and media_result.get('data'):
+        file_bytes = base64.b64decode(media_result['data'])
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+        
+        hashes = get_chat_hashes(chat_dir)
+        if file_hash in hashes:
+            print("  -> ¡Sticker/Media duplicado detectado! Omitiendo descarga para ahorrar espacio.")
+            return hashes[file_hash]
+
         ext = ".bin"
         mime = media_result.get('type', '')
         if 'video' in mime: ext = '.mp4'
@@ -208,16 +233,18 @@ def descargar_media(page, url, chat_dir, idx):
         elif 'png' in mime: ext = '.png'
         elif 'image' in mime: ext = '.jpg'
         
-        filename = f"media_{int(time.time())}_{idx}{ext}"
+        filename = f"media_{int(time.time())}_{idx}_{file_hash[:6]}{ext}"
         media_folder = os.path.join(chat_dir, "media")
         os.makedirs(media_folder, exist_ok=True)
         filepath = os.path.join(media_folder, filename)
         
         # Guardar archivo binario
         with open(filepath, "wb") as f:
-            f.write(base64.b64decode(media_result['data']))
+            f.write(file_bytes)
             
-        return f"media/{filename}"
+        local_path = f"media/{filename}"
+        hashes[file_hash] = local_path
+        return local_path
     return None
 
 def iniciar_guardado_mensajes():
@@ -281,10 +308,20 @@ def iniciar_guardado_mensajes():
                                     
                                     // 3. Extraer multimedia (ignorando emojis)
                                     const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video');
-                                    const mediaUrls = Array.from(mediaNodes).map(n => ({
-                                        tag: n.tagName.toLowerCase(),
-                                        src: n.src
-                                    })).filter(n => n.src && (n.src.startsWith('blob:') || n.src.startsWith('data:image/')));
+                                    const mediaUrls = [];
+                                    
+                                    mediaNodes.forEach(n => {
+                                        let url = n.src;
+                                        // Algunos videos de WhatsApp tienen el src en una etiqueta <source> interna
+                                        if (n.tagName.toLowerCase() === 'video' && !url) {
+                                            const source = n.querySelector('source');
+                                            if (source) url = source.src;
+                                        }
+                                        
+                                        if (url && (url.startsWith('blob:') || url.startsWith('data:image/') || url.startsWith('data:video/'))) {
+                                            mediaUrls.push({ tag: n.tagName.toLowerCase(), src: url });
+                                        }
+                                    });
                                     
                                     return { dataId, infoMetaRaw, textoMensaje, mediaUrls };
                                 }"""
