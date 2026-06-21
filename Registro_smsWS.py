@@ -37,7 +37,8 @@ def iniciar_guardado_mensajes():
 
         try:
             while True:
-                elementos_mensajes = page.query_selector_all('.message-in .copyable-text')
+                    # Buscamos tanto mensajes entrantes (in) como salientes (out)
+                elementos_mensajes = page.query_selector_all('.message-in .copyable-text, .message-out .copyable-text')
                 
                 if elementos_mensajes:
                     ultimo_elemento = elementos_mensajes[-1]
