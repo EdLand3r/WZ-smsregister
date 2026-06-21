@@ -2,6 +2,7 @@ import os
 import time
 import tempfile
 import json
+import base64
 from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = os.path.join(tempfile.gettempdir(), "playwright_whatsapp_firefox")
@@ -86,6 +87,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-bottom: 4px;
             display: block;
         }}
+        .media-content img, .media-content video {{
+            max-width: 100%;
+            border-radius: 8px;
+            margin-top: 5px;
+            margin-bottom: 5px;
+            display: block;
+            background-color: rgba(255,255,255,0.05);
+        }}
     </style>
 </head>
 <body>
@@ -102,16 +111,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             div.className = 'msg ' + (m.is_outgoing ? 'msg-out' : 'msg-in');
             
             let html = '';
+            // Remitente
             if (!m.is_outgoing && m.sender) {{
                 html += `<span class="sender">${{m.sender}}</span>`;
             }}
-            html += `<span>${{m.texto.replace(/\\n/g, '<br>')}}</span>`;
+            
+            // Multimedia
+            if (m.media && m.media.length > 0) {{
+                html += '<div class="media-content">';
+                m.media.forEach(media => {{
+                    if (media.tag === 'img') {{
+                        html += `<img src="${{media.local_path}}" alt="Imagen recibida">`;
+                    }} else if (media.tag === 'video') {{
+                        html += `<video src="${{media.local_path}}" controls></video>`;
+                    }}
+                }});
+                html += '</div>';
+            }}
+            
+            // Texto
+            if (m.texto) {{
+                html += `<span>${{m.texto.replace(/\\n/g, '<br>')}}</span>`;
+            }}
+            
+            // Metadatos (Hora)
             html += `<span class="meta">${{m.meta}}</span>`;
             
             div.innerHTML = html;
             container.appendChild(div);
         }});
-        // Scroll al fondo
+        
+        // Scroll al fondo al cargar
         const chatContainer = document.querySelector('.chat-container');
         chatContainer.scrollTop = chatContainer.scrollHeight;
     </script>
@@ -137,7 +167,6 @@ def inicializar_archivos_chat(chat_dir, chat_name):
             f.write(HTML_TEMPLATE.format(chat_name=chat_name))
 
 def extraer_info(info_meta_raw):
-    # Formato típico: "[12:34 p. m., 20/6/2026] Nombre:"
     try:
         if "]" in info_meta_raw:
             parts = info_meta_raw.split("]", 1)
@@ -147,6 +176,49 @@ def extraer_info(info_meta_raw):
     except Exception:
         pass
     return info_meta_raw, "Desconocido"
+
+def descargar_media(page, url, chat_dir, idx):
+    js_code = """
+    async (url) => {
+        try {
+            const response = await fetch(url);
+            const blob = await response.blob();
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    resolve({
+                        data: reader.result.split(',')[1],
+                        type: blob.type
+                    });
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        } catch (e) {
+            return null;
+        }
+    }
+    """
+    media_result = page.evaluate(js_code, url)
+    if media_result and media_result.get('data'):
+        ext = ".bin"
+        mime = media_result.get('type', '')
+        if 'video' in mime: ext = '.mp4'
+        elif 'webp' in mime: ext = '.webp'
+        elif 'png' in mime: ext = '.png'
+        elif 'image' in mime: ext = '.jpg'
+        
+        filename = f"media_{int(time.time())}_{idx}{ext}"
+        media_folder = os.path.join(chat_dir, "media")
+        os.makedirs(media_folder, exist_ok=True)
+        filepath = os.path.join(media_folder, filename)
+        
+        # Guardar archivo binario
+        with open(filepath, "wb") as f:
+            f.write(base64.b64decode(media_result['data']))
+            
+        return f"media/{filename}"
+    return None
 
 def iniciar_guardado_mensajes():
     if not os.path.exists(USER_DATA_DIR):
@@ -176,67 +248,96 @@ def iniciar_guardado_mensajes():
             context.close()
             return
 
-        print("Escuchando mensajes en el chat activo... Presiona Ctrl+C para salir.")
-        ultimo_mensaje_guardado = ""
+        print("Escuchando mensajes multimedia y de texto... Presiona Ctrl+C para salir.")
+        ultimo_mensaje_id = ""
 
         try:
             while True:
-                # 1. Obtener el nombre del chat actual
-                # WhatsApp suele poner el nombre en el header
                 header_title = page.query_selector('#main header [dir="auto"][title], #main header span[dir="auto"]')
                 if header_title:
-                    chat_name = header_title.get_attribute("title")
-                    if not chat_name:
-                        chat_name = header_title.inner_text()
-                        
+                    chat_name = header_title.get_attribute("title") or header_title.inner_text()
                     if chat_name:
                         chat_name_clean = limpiar_nombre(chat_name)
                         if chat_name_clean:
                             chat_dir = os.path.join(CHATS_BASE_DIR, chat_name_clean)
                             inicializar_archivos_chat(chat_dir, chat_name)
                             
-                            # 2. Buscar mensajes
-                            elementos_mensajes = page.query_selector_all('[data-pre-plain-text]')
+                            # Buscar mensajes. Usamos un selector general (role="row") porque los stickers 
+                            # sin texto no siempre tienen el atributo data-pre-plain-text
+                            elementos_mensajes = page.query_selector_all('[role="row"]')
                             if elementos_mensajes:
                                 ultimo_elemento = elementos_mensajes[-1]
-                                info_meta_raw = ultimo_elemento.get_attribute('data-pre-plain-text')
-                                texto_mensaje = ultimo_elemento.inner_text()
                                 
-                                if texto_mensaje and info_meta_raw:
-                                    texto_limpio = texto_mensaje.strip()
-                                    mensaje_completo = f"{info_meta_raw} {texto_limpio}"
+                                # Extraer datos usando JS
+                                js_extractor = """row => {
+                                    // 1. Obtener ID único
+                                    const dataIdContainer = row.querySelector('[data-id]') || row;
+                                    const dataId = dataIdContainer ? dataIdContainer.getAttribute('data-id') : '';
                                     
-                                    if mensaje_completo != ultimo_mensaje_guardado:
-                                        ultimo_mensaje_guardado = mensaje_completo
+                                    // 2. Obtener metadatos y texto (si existen)
+                                    const textContainer = row.querySelector('[data-pre-plain-text]');
+                                    const infoMetaRaw = textContainer ? textContainer.getAttribute('data-pre-plain-text') : '';
+                                    const textoMensaje = textContainer ? textContainer.innerText : '';
+                                    
+                                    // 3. Extraer multimedia (ignorando emojis)
+                                    const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video');
+                                    const mediaUrls = Array.from(mediaNodes).map(n => ({
+                                        tag: n.tagName.toLowerCase(),
+                                        src: n.src
+                                    })).filter(n => n.src && (n.src.startsWith('blob:') || n.src.startsWith('data:image/')));
+                                    
+                                    return { dataId, infoMetaRaw, textoMensaje, mediaUrls };
+                                }"""
+                                
+                                data_info = ultimo_elemento.evaluate(js_extractor)
+                                msg_id = data_info.get("dataId", "")
+                                
+                                # Ignorar filas de sistema (fechas) que no tienen data-id
+                                if msg_id and msg_id != ultimo_mensaje_id:
+                                    ultimo_mensaje_id = msg_id
+                                    
+                                    # Extraer texto y metadata
+                                    info_meta_raw = data_info.get("infoMetaRaw", "")
+                                    texto_mensaje = data_info.get("textoMensaje", "")
+                                    texto_limpio = texto_mensaje.strip()
+                                    
+                                    meta_str, sender = extraer_info(info_meta_raw) if info_meta_raw else ("", "")
+                                    is_outgoing = msg_id.startswith("true_")
+                                    
+                                    # Procesar Multimedia
+                                    media_list = []
+                                    media_urls = data_info.get("mediaUrls", [])
+                                    if media_urls:
+                                        print(f"Descargando {len(media_urls)} archivo(s) multimedia...")
+                                        for idx, m in enumerate(media_urls):
+                                            local_path = descargar_media(page, m["src"], chat_dir, idx)
+                                            if local_path:
+                                                media_list.append({
+                                                    "tag": m["tag"],
+                                                    "local_path": local_path
+                                                })
+                                    
+                                    msg_obj = {
+                                        "meta": meta_str,
+                                        "sender": sender,
+                                        "texto": texto_limpio,
+                                        "is_outgoing": is_outgoing,
+                                        "media": media_list
+                                    }
+                                    
+                                    # Guardar en data.js
+                                    js_path = os.path.join(chat_dir, "data.js")
+                                    with open(js_path, "a", encoding="utf-8") as archivo:
+                                        archivo.write(f"mensajes.push({json.dumps(msg_obj, ensure_ascii=False)});\n")
                                         
-                                        meta_str, sender = extraer_info(info_meta_raw)
+                                    # Guardar en historial.txt (Solo texto y aviso de media)
+                                    txt_path = os.path.join(chat_dir, "historial.txt")
+                                    with open(txt_path, "a", encoding="utf-8") as archivo:
+                                        media_aviso = f" [+ {len(media_list)} archivo(s) multimedia]" if media_list else ""
+                                        archivo.write(f"{info_meta_raw} {texto_limpio}{media_aviso}\n")
                                         
-                                        # Determinar si el mensaje lo enviamos nosotros o lo recibimos
-                                        # WhatsApp usa "true_" en el ID para mensajes enviados y "false_" para recibidos
-                                        data_id = ultimo_elemento.evaluate("el => { const parent = el.closest('[data-id]'); return parent ? parent.getAttribute('data-id') : ''; }")
-                                        is_outgoing = data_id.startswith("true_")
-                                        
-                                        msg_obj = {
-                                            "meta": meta_str,
-                                            "sender": sender,
-                                            "texto": texto_limpio,
-                                            "is_outgoing": is_outgoing
-                                        }
-                                        
-                                        # Guardar en data.js
-                                        js_path = os.path.join(chat_dir, "data.js")
-                                        with open(js_path, "a", encoding="utf-8") as archivo:
-                                            # Añadir un salto de linea al final para evitar errores
-                                            archivo.write(f"mensajes.push({json.dumps(msg_obj, ensure_ascii=False)});\n")
-                                            
-                                        # Guardar en historial.txt (Respaldo)
-                                        txt_path = os.path.join(chat_dir, "historial.txt")
-                                        with open(txt_path, "a", encoding="utf-8") as archivo:
-                                            archivo.write(f"{mensaje_completo}\n")
-                                            
-                                        print(f"\\n[NUEVO en '{chat_name}'] Guardado: {texto_limpio[:40]}...")
-                                else:
-                                    print(f"Mensaje sin texto detectado en {chat_name}.", end="\\r")
+                                    log_texto = texto_limpio[:30] + "..." if texto_limpio else "[Media]"
+                                    print(f"\\n[NUEVO en '{chat_name}'] Guardado: {log_texto}")
                             else:
                                 print(f"Aún no hay mensajes en {chat_name}.", end="\\r")
                         else:
@@ -247,13 +348,13 @@ def iniciar_guardado_mensajes():
                 time.sleep(3)
                 
         except KeyboardInterrupt:
-            print("\\nDeteniendo el guardado de mensajes de forma segura...")
+            print("\\nDeteniendo de forma segura...")
         finally:
             try:
                 context.close()
-                print("Navegador cerrado correctamente.")
+                print("Navegador cerrado.")
             except Exception:
-                print("Proceso finalizado.")
+                pass
 
 if __name__ == "__main__":
     iniciar_guardado_mensajes()
