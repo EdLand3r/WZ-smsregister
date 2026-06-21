@@ -295,42 +295,54 @@ def iniciar_guardado_mensajes():
                             if elementos_mensajes:
                                 ultimo_elemento = elementos_mensajes[-1]
                                 
-                                # Extraer datos usando JS
-                                js_extractor = """row => {
-                                    // 1. Obtener ID único
-                                    const dataIdContainer = row.querySelector('[data-id]') || row;
-                                    const dataId = dataIdContainer ? dataIdContainer.getAttribute('data-id') : '';
-                                    
-                                    // 2. Obtener metadatos y texto (si existen)
-                                    const textContainer = row.querySelector('[data-pre-plain-text]');
-                                    const infoMetaRaw = textContainer ? textContainer.getAttribute('data-pre-plain-text') : '';
-                                    const textoMensaje = textContainer ? textContainer.innerText : '';
-                                    
-                                    // 3. Extraer multimedia (ignorando emojis)
-                                    const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video');
-                                    const mediaUrls = [];
-                                    
-                                    mediaNodes.forEach(n => {
-                                        let url = n.src;
-                                        // Algunos videos de WhatsApp tienen el src en una etiqueta <source> interna
-                                        if (n.tagName.toLowerCase() === 'video' && !url) {
-                                            const source = n.querySelector('source');
-                                            if (source) url = source.src;
-                                        }
-                                        
-                                        if (url && (url.startsWith('blob:') || url.startsWith('data:image/') || url.startsWith('data:video/'))) {
-                                            mediaUrls.push({ tag: n.tagName.toLowerCase(), src: url });
-                                        }
-                                    });
-                                    
-                                    return { dataId, infoMetaRaw, textoMensaje, mediaUrls };
-                                }"""
-                                
-                                data_info = ultimo_elemento.evaluate(js_extractor)
-                                msg_id = data_info.get("dataId", "")
+                                # Primero, sacamos SOLO el ID de manera rápida para saber si es nuevo
+                                msg_id = ultimo_elemento.evaluate("el => { const c = el.querySelector('[data-id]') || el; return c ? c.getAttribute('data-id') : ''; }")
                                 
                                 # Ignorar filas de sistema (fechas) que no tienen data-id
                                 if msg_id and msg_id != ultimo_mensaje_id:
+                                    # ¡NUEVO MENSAJE DETECTADO!
+                                    # Hacemos una pausa de 2 segundos antes de extraer los datos.
+                                    time.sleep(2)
+                                    
+                                    # CRÍTICO: WhatsApp Web destruye y recrear los nodos HTML cuando el video
+                                    # termina de cargar. Tenemos que volver a buscar el elemento en el DOM actualizado.
+                                    fila_actualizada = page.query_selector(f'[data-id="{msg_id}"]')
+                                    if not fila_actualizada:
+                                        # Si no lo encuentra por ID (raro), buscamos el último nuevamente
+                                        filas_nuevas = page.query_selector_all('[role="row"]')
+                                        fila_actualizada = filas_nuevas[-1] if filas_nuevas else ultimo_elemento
+                                        
+                                    # Extraer datos usando JS ahora que ya cargó y tenemos el nodo fresco
+                                    js_extractor = """el => {
+                                        const row = el.closest('[role="row"]') || el;
+                                        // 2. Obtener metadatos y texto (si existen)
+                                        const textContainer = row.querySelector('[data-pre-plain-text]');
+                                        const infoMetaRaw = textContainer ? textContainer.getAttribute('data-pre-plain-text') : '';
+                                        const textoMensaje = textContainer ? textContainer.innerText : '';
+                                        
+                                        // 3. Extraer multimedia (ignorando emojis)
+                                        const mediaNodes = row.querySelectorAll('img:not([data-plain-text]):not(.selectable-text), video');
+                                        const mediaUrls = [];
+                                        
+                                        // DEBUG: Extraer todos los img y video sin filtros
+                                        const allMediaDebug = Array.from(row.querySelectorAll('img, video')).map(n => n.outerHTML);
+                                        
+                                        mediaNodes.forEach(n => {
+                                            let url = n.src;
+                                            if (n.tagName.toLowerCase() === 'video' && !url) {
+                                                const source = n.querySelector('source');
+                                                if (source) url = source.src;
+                                            }
+                                            
+                                            if (url && (url.startsWith('blob:') || url.startsWith('data:image/') || url.startsWith('data:video/'))) {
+                                                mediaUrls.push({ tag: n.tagName.toLowerCase(), src: url });
+                                            }
+                                        });
+                                        
+                                        return { infoMetaRaw, textoMensaje, mediaUrls, allMediaDebug, htmlDump: row.outerHTML };
+                                    }"""
+                                    
+                                    data_info = fila_actualizada.evaluate(js_extractor)
                                     ultimo_mensaje_id = msg_id
                                     
                                     # Extraer texto y metadata
@@ -344,6 +356,29 @@ def iniciar_guardado_mensajes():
                                     # Procesar Multimedia
                                     media_list = []
                                     media_urls = data_info.get("mediaUrls", [])
+                                    
+                                    # --- PARCHE PARA VIDEOS (Click to load) ---
+                                    # WhatsApp Web ya no pone el <video> en el chat, solo pone fondos de imagen.
+                                    # Tenemos que simular un clic para abrirlo, robar el link, y cerrarlo.
+                                    video_div = fila_actualizada.query_selector('[data-testid="video-content"]')
+                                    if video_div:
+                                        try:
+                                            video_div.click()
+                                            # Esperamos hasta 4 segundos a que el reproductor inyecte el video real
+                                            video_real = page.wait_for_selector('video[src^="blob:"]', timeout=4000)
+                                            if video_real:
+                                                v_src = video_real.get_attribute("src")
+                                                if v_src and not any(m.get("src") == v_src for m in media_urls):
+                                                    media_urls.append({"tag": "video", "src": v_src})
+                                        except Exception:
+                                            pass
+                                        finally:
+                                            # Cerramos el reproductor pulsando Escape
+                                            page.keyboard.press("Escape")
+                                            time.sleep(0.5)
+                                            
+                                    all_media_debug = data_info.get("allMediaDebug", [])
+                                    
                                     if media_urls:
                                         print(f"Descargando {len(media_urls)} archivo(s) multimedia...")
                                         for idx, m in enumerate(media_urls):
@@ -353,6 +388,18 @@ def iniciar_guardado_mensajes():
                                                     "tag": m["tag"],
                                                     "local_path": local_path
                                                 })
+                                    elif all_media_debug:
+                                        print(f"\\n[DEBUG INFO] Se encontró media pero los filtros la ignoraron. Etiquetas HTML encontradas:")
+                                        for tag in all_media_debug:
+                                            # Limitar a 150 caracteres para no llenar la consola si es data:image
+                                            print(f" -> {tag[:150]}...")
+                                            
+                                    if not media_urls and not texto_limpio:
+                                        html_dump = data_info.get("htmlDump", "")
+                                        debug_path = os.path.join(chat_dir, "debug_row.html")
+                                        with open(debug_path, "w", encoding="utf-8") as f:
+                                            f.write(html_dump)
+                                        print(f"\\n[SISTEMA] He guardado un reporte técnico en: {debug_path}")
                                     
                                     msg_obj = {
                                         "meta": meta_str,
